@@ -48,9 +48,9 @@ def _apply_rotary_emb_torch(x, cos, sin, is_neox_style):
 def _compute_cos_sin_cache(max_position: int,
                            rot_dim: int,
                            base: float = 10000.0) -> torch.Tensor:
-    inv_freq = 1.0 / (base**(torch.arange(0, rot_dim, 2, dtype=torch.float) /
-                             rot_dim))
-    t = torch.arange(max_position, dtype=torch.float)
+    inv_freq = 1.0 / (base**(torch.arange(
+        0, rot_dim, 2, dtype=torch.float, device="cpu") / rot_dim))
+    t = torch.arange(max_position, dtype=torch.float, device="cpu")
     freqs = torch.einsum("i,j->ij", t, inv_freq)  # [max_pos, rot_dim//2]
     return torch.cat((freqs.cos(), freqs.sin()), dim=-1)  # [max_pos, rot_dim]
 
@@ -177,12 +177,13 @@ def test_multimodal_rotary_embedding(device, is_neox_style, use_key, head_size,
 
     # positions: different per section to exercise M-RoPE routing
     positions = torch.stack([
-        torch.randint(0, max_position, (num_tokens, ))
+        torch.randint(0, max_position, (num_tokens, ), device="cpu")
         for _ in range(num_sections)
     ])  # [num_sections, num_tokens]
 
-    query = torch.randn(num_tokens, num_heads, head_size)
-    key = torch.randn(num_tokens, num_kv_heads, head_size) if use_key else None
+    query = torch.randn(num_tokens, num_heads, head_size, device="cpu")
+    key = torch.randn(num_tokens, num_kv_heads, head_size,
+                      device="cpu") if use_key else None
 
     # ── reference ──
     ref_q, ref_k = _ref_multimodal_rotary_embedding(positions, query, key,
@@ -195,9 +196,9 @@ def test_multimodal_rotary_embedding(device, is_neox_style, use_key, head_size,
     xpu_q, xpu_k = _run_kernel(device, positions, query, key, cos_sin_cache,
                                is_neox_style, mrope_section)
 
-    torch.testing.assert_close(xpu_q, ref_q, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(xpu_q, ref_q.cpu(), atol=1e-4, rtol=1e-4)
     if use_key:
-        torch.testing.assert_close(xpu_k, ref_k, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(xpu_k, ref_k.cpu(), atol=1e-4, rtol=1e-4)
 
 
 @pytest.mark.parametrize("device", ["xpu"])
@@ -215,11 +216,11 @@ def test_mrope_matches_standard_rope_for_text_tokens(device, is_neox_style):
 
     cos_sin_cache = _compute_cos_sin_cache(max_position, rot_dim, base)
 
-    positions_1d = torch.randint(0, max_position, (num_tokens, ))
+    positions_1d = torch.randint(0, max_position, (num_tokens, ), device="cpu")
     positions_mrope = positions_1d.unsqueeze(0)  # [1, num_tokens]
 
-    query = torch.randn(num_tokens, num_heads, head_size)
-    key = torch.randn(num_tokens, num_heads, head_size)
+    query = torch.randn(num_tokens, num_heads, head_size, device="cpu")
+    key = torch.randn(num_tokens, num_heads, head_size, device="cpu")
 
     # --- standard RoPE via XPU op ---
     q_std = query.clone().to(device)
