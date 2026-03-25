@@ -110,6 +110,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "-> ()");
   ops.impl("swigluoai_and_mul", torch::kXPU, &swigluoai_and_mul);
 
+  ops.def("relu2_no_mul(Tensor! out, Tensor! input) -> ()");
+  ops.impl("relu2_no_mul", torch::kXPU, &relu2_no_mul);
+
   ops.def(
       "get_xpu_view_from_cpu_tensor(Tensor cpu_tensor) -> "
       "Tensor");

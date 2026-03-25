@@ -246,6 +246,11 @@ def swigluoai_and_mul(
     torch.ops._C.swigluoai_and_mul(out, input, alpha, limit)
 
 
+def relu2_no_mul(out: torch.Tensor, input: torch.Tensor) -> None:
+    """Relu2 (squared ReLU) activation function without mul."""
+    torch.ops._C.relu2_no_mul(out, input)
+
+
 # onednn gemm
 def int4_gemm_w4a16(input: torch.Tensor, weight: torch.Tensor,
                     bias: Optional[torch.Tensor], scales: torch.Tensor,
