@@ -193,16 +193,17 @@ def xpu_fused_moe(hidden_states,
         gemm1_scales = w13_scales
         gemm2_scales = w2_scales
 
-    if expert_map is None:
+    if expert_map is None and ep_size > 1:
         expert_map = torch.empty((num_experts * ep_size),
                                  dtype=torch.int32,
                                  device=hidden_states.device)
         torch.ops._moe_C.init_expert_map(expert_map, num_experts, ep_rank,
                                          ep_size)
-    else:
-        pass
 
-    total_experts_num = expert_map.shape[0]
+    if expert_map is not None:
+        total_experts_num = expert_map.shape[0]
+    else:
+        total_experts_num = num_experts * ep_size
     local_experts_num = num_experts
 
     remapped_hidden_states = torch.empty(
@@ -258,6 +259,8 @@ def xpu_fused_moe(hidden_states,
         torch.ops._C.swigluoai_and_mul(act_output, gemm1_output, 1.702, 7.0)
     elif activation == "relu2_no_mul":
         torch.ops._C.relu2_no_mul(act_output, gemm1_output)
+    elif activation == "swiglustep":
+        torch.ops._C.swiglustep_and_mul(act_output, gemm1_output, 7.0)
     else:
         raise ValueError(f"Unsupported FusedMoe activation: {activation}.")
 
