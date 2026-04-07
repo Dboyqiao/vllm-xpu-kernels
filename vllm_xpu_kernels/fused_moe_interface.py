@@ -245,9 +245,9 @@ def xpu_fused_moe(hidden_states,
         is_B_int4=is_int4,
         is_B_mxfp4=is_mxfp4)
 
-    inter_size_scale = 1
+    inter_size_scale = 2 if activation == "relu2_no_mul" else 1
     # act
-    act_output = torch.empty((num_moe_inputs, inter_size),
+    act_output = torch.empty((num_moe_inputs, inter_size * inter_size_scale),
                              dtype=gemm1_output.dtype,
                              device=gemm1_output.device)
     if activation == "silu":
@@ -257,9 +257,7 @@ def xpu_fused_moe(hidden_states,
     elif activation == "swigluoai" or ("SWIGLUOAI" in str(activation)):
         torch.ops._C.swigluoai_and_mul(act_output, gemm1_output, 1.702, 7.0)
     elif activation == "relu2_no_mul":
-        act_output = torch.empty_like(gemm1_output)
         torch.ops._C.relu2_no_mul(act_output, gemm1_output)
-        inter_size_scale = 2
     else:
         raise ValueError(f"Unsupported FusedMoe activation: {activation}.")
 
