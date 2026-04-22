@@ -68,6 +68,9 @@ struct chunk_prefill_args_t {
   int o_stride_seq = 0;
   int o_stride_heads = 0;
   int o_stride_batch = 0;
+  // stride(0)/stride(1) of KV cache; = block_size for contiguous,
+  // 2*block_size for hybrid interleaved layout.
+  int block_stride_elems = 0;
 };
 
 template <class FMHAKernel, bool isVarLen>
@@ -173,6 +176,7 @@ struct KernelLauncher {
          args.block_size,
          args.max_blocks_per_seq,
          args.total_seqlen_k,
+         args.block_stride_elems,
          args.window_size_left,
          args.window_size_right},
         {},

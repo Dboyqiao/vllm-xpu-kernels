@@ -147,7 +147,15 @@ MINI_PYTEST_PARAMS = {
         "num_heads": [(8, 1)],
         "head_size_kv": [(192, 128)],
         "num_blocks": [2048],
-    }
+    },
+    "test_paged_decode_noncontiguous_qkv": {
+        "seq_lens": [[(1, 1025), (1, 523), (1, 37)]],
+        "num_heads": [(8, 2)],
+        "head_size": [64, 128],
+        "num_blocks": [2048],
+        "noncontig_mode": ["interleaved_kv", "padded_head", "fused_qkv",
+                           "hybrid_blocks"],
+    },
 }
 
 
@@ -511,6 +519,7 @@ def test_decode_with_paged_kv(
     torch.xpu.empty_cache()
 
 
+
 @pytest.mark.parametrize(
     "seq_lens",
     [[(1, 1025)], [(1, 523), (1, 37),
@@ -616,3 +625,176 @@ def test_decode_with_paged_kv_mla(
     torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol), \
         f"{torch.max(torch.abs(output - ref_output))}"
     torch.xpu.empty_cache()
+
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [[(1, 1025), (1, 523), (1, 37)],
+     [(1, 523), (1, 37), (1, 2011), (1, 5000)]])
+@pytest.mark.parametrize("num_heads", [(8, 2), (8, 1)])
+@pytest.mark.parametrize("head_size", [64, 128, 256])
+@pytest.mark.parametrize("block_size", BLOCK_SIZES)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("num_blocks", [2048])
+@pytest.mark.parametrize("noncontig_mode",
+                         ["interleaved_kv", "padded_head", "fused_qkv",
+                          "hybrid_blocks"])
+@torch.inference_mode()
+def test_paged_decode_noncontiguous_qkv(
+    seq_lens: list[tuple[int, int]],
+    num_heads: tuple[int, int],
+    head_size: int,
+    block_size: int,
+    dtype: torch.dtype,
+    num_blocks: int,
+    noncontig_mode: str,
+) -> None:
+    """Test paged decode with non-contiguous Q, K, V tensors.
+
+    The paged decode kernel reads actual tensor strides for K and V, so
+    it should handle non-contiguous KV cache layouts correctly.
+
+    Non-contiguous modes:
+    - interleaved_kv: K and V share a combined buffer of shape
+          [num_blocks, block_size, num_kv_heads, 2*head_size].
+      K = buf[..., :head_size], V = buf[..., head_size:].
+      Both are non-contiguous with stride(-2) = 2*head_size.
+    - padded_head: KV buffer has extra padding in the last dimension.
+          [num_blocks, block_size, num_kv_heads, head_size + pad].
+      K = buf[..., :head_size].  V is a separate padded buffer.
+    - fused_qkv: Q is sliced from a fused QKV projection of shape
+          [total_tokens, (num_q_heads + 2*num_kv_heads), head_size].
+      Q is non-contiguous (stride(0) != num_q_heads * head_size) and
+      must be made contiguous before entering the kernel.  KV cache is
+      interleaved as in the interleaved_kv mode.
+    - hybrid_blocks: Simulates vLLM hybrid model (Mamba + Attention)
+          where KV cache has layout (num_blocks, 2, block_size,
+          num_kv_heads, head_size).  K = buf[:, 0], V = buf[:, 1].
+      stride(0) = 2 * block_size * heads * head_size, so
+      block_stride_elems = 2 * block_size.  This exercises the
+      page_stride_tiles != tiles_per_page code path.
+    """
+    torch.set_default_device("xpu")
+    torch.xpu.set_device("xpu:0")
+    torch.manual_seed(42)
+
+    num_seqs = len(seq_lens)
+    query_lens = [x[0] for x in seq_lens]
+    kv_lens = [x[1] for x in seq_lens]
+    num_query_heads = num_heads[0]
+    num_kv_heads = num_heads[1]
+    assert num_query_heads % num_kv_heads == 0
+    max_query_len = max(query_lens)
+    max_kv_len = max(kv_lens)
+    scale = head_size**-0.5
+
+    # ── Build non-contiguous Q ──────────────────────────────────────
+    if noncontig_mode == "fused_qkv":
+        total_heads = num_query_heads + 2 * num_kv_heads
+        fused_qkv = torch.randn(sum(query_lens),
+                                 total_heads,
+                                 head_size,
+                                 dtype=dtype)
+        q_slice = fused_qkv[:, :num_query_heads, :]
+        assert not q_slice.is_contiguous(), \
+            "fused Q slice should be non-contiguous"
+        assert q_slice.stride(-1) == 1
+        # The kernel requires Q to be contiguous (CHECK_CONTIGUOUS),
+        # so we call .contiguous() explicitly, mimicking the real
+        # vLLM code path after fused QKV projection + split.
+        query = q_slice.contiguous()
+    else:
+        query = torch.randn(sum(query_lens),
+                             num_query_heads,
+                             head_size,
+                             dtype=dtype)
+    assert query.is_contiguous()
+
+    # ── Build non-contiguous K / V cache ────────────────────────────
+    if noncontig_mode == "interleaved_kv" or noncontig_mode == "fused_qkv":
+        # Combined buffer: K and V interleaved in the head dimension
+        combined_kv = torch.randn(num_blocks,
+                                  block_size,
+                                  num_kv_heads,
+                                  2 * head_size,
+                                  dtype=dtype)
+        key_cache = combined_kv[..., :head_size]
+        value_cache = combined_kv[..., head_size:]
+    elif noncontig_mode == "padded_head":
+        # Padded buffer: extra 32 elements padding after head_size
+        pad = 32
+        key_buf = torch.randn(num_blocks,
+                               block_size,
+                               num_kv_heads,
+                               head_size + pad,
+                               dtype=dtype)
+        val_buf = torch.randn(num_blocks,
+                               block_size,
+                               num_kv_heads,
+                               head_size + pad,
+                               dtype=dtype)
+        key_cache = key_buf[..., :head_size]
+        value_cache = val_buf[..., :head_size]
+    elif noncontig_mode == "hybrid_blocks":
+        # True hybrid layout: K and V blocks alternate in dim 1
+        # Mimics vLLM _update_hybrid_attention_mamba_layout which
+        # transposes (2, num_blocks, B, H, D) -> (num_blocks, 2, B, H, D)
+        hybrid_kv = torch.randn(num_blocks, 2, block_size,
+                                num_kv_heads, head_size, dtype=dtype)
+        key_cache = hybrid_kv[:, 0, :, :, :]
+        value_cache = hybrid_kv[:, 1, :, :, :]
+        # Verify stride(0) = 2 * block_size * heads * head_size
+        expected_stride0 = 2 * block_size * num_kv_heads * head_size
+        assert key_cache.stride(0) == expected_stride0, \
+            f"Expected stride(0)={expected_stride0}, got {key_cache.stride(0)}"
+
+    # Verify non-contiguity invariants
+    assert not key_cache.is_contiguous(), \
+        f"key_cache should be non-contiguous in mode={noncontig_mode}"
+    assert not value_cache.is_contiguous(), \
+        f"value_cache should be non-contiguous in mode={noncontig_mode}"
+    assert key_cache.stride(-1) == 1
+    assert value_cache.stride(-1) == 1
+
+    cu_query_lens = torch.tensor([0] + query_lens,
+                                 dtype=torch.int32).cumsum(dim=0,
+                                                           dtype=torch.int32)
+    seq_k = torch.tensor(kv_lens, dtype=torch.int32)
+
+    max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
+    block_tables = torch.randint(0,
+                                 num_blocks,
+                                 (num_seqs, max_num_blocks_per_seq),
+                                 dtype=torch.int32)
+
+    output = flash_attn_varlen_func(query,
+                                    key_cache,
+                                    value_cache,
+                                    max_query_len,
+                                    cu_query_lens,
+                                    max_kv_len,
+                                    seqused_k=seq_k,
+                                    softmax_scale=scale,
+                                    causal=False,
+                                    block_table=block_tables,
+                                    window_size=(-1, -1))
+
+    ref_output = ref_paged_attn(query=query,
+                                key_cache=key_cache,
+                                value_cache=value_cache,
+                                query_lens=query_lens,
+                                kv_lens=kv_lens,
+                                block_tables=block_tables,
+                                scale=scale,
+                                casual=False,
+                                is_paged=True,
+                                sink=None,
+                                window_size_left=-1,
+                                window_size_right=-1)
+
+    atol, rtol = 1e-2, 1e-2
+    torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol), \
+        f"{torch.max(torch.abs(output - ref_output))}"
+    torch.xpu.empty_cache()
+

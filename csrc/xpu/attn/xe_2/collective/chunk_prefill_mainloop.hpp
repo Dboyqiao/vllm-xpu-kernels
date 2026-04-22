@@ -198,6 +198,8 @@ struct FMHAFwdMainloop<
     int page_size;
     int max_pages_per_seq;
     int total_seqlen_kv;
+    // stride(0)/stride(1) of KV cache for hybrid interleaved layout
+    int block_stride_elems;
     // Local Mask
     int local_left, local_right;
   };
@@ -228,6 +230,7 @@ struct FMHAFwdMainloop<
         args.page_size,
         args.max_pages_per_seq,
         args.total_seqlen_kv,
+        args.block_stride_elems,
         args.local_left,
         args.local_right};
   }
@@ -238,6 +241,9 @@ struct FMHAFwdMainloop<
 
   CUTLASS_DEVICE int get_paged_idx(int K, int idx_b) {
     int tiles_per_page = params.page_size / get<1>(TileShapeQK{});
+    // stride_tiles accounts for hybrid interleaved layout where
+    // block_stride_elems > block_size (e.g. K/V alternating blocks)
+    int stride_tiles = params.block_stride_elems / get<1>(TileShapeQK{});
     int b_offset = idx_b * params.max_pages_per_seq;
     int page_local_idx = K * get<1>(TileShapeQK{}) / params.page_size;
 
@@ -246,7 +252,7 @@ struct FMHAFwdMainloop<
       page_local_idx = params.max_pages_per_seq - 1;
     }
 
-    return params.ptr_page_table[b_offset + page_local_idx] * tiles_per_page +
+    return params.ptr_page_table[b_offset + page_local_idx] * stride_tiles +
            K % tiles_per_page;
   }
 
@@ -686,6 +692,8 @@ struct DecodeFwdMainloop<
     int page_size;
     int max_pages_per_seq;
     int total_seqlen_kv;
+    // stride(0)/stride(1) of KV cache for hybrid interleaved layout
+    int block_stride_elems;
     // Local Mask
     int window_size_left;
     int window_size_right;
@@ -717,6 +725,7 @@ struct DecodeFwdMainloop<
         args.page_size,
         args.max_pages_per_seq,
         args.total_seqlen_kv,
+        args.block_stride_elems,
         args.window_size_left,
         args.window_size_right};
   }
@@ -831,12 +840,13 @@ struct DecodeFwdMainloop<
 
     // PagedKV
     int tiles_per_page = params.page_size / get<1>(TileShapeQK{});
+    int stride_tiles = params.block_stride_elems / get<1>(TileShapeQK{});
     int tile_idx = blk_k0;
     int b_offset = idx_b * params.max_pages_per_seq;
     if constexpr (PagedKV) {
       int page_local_idx = tile_idx * get<1>(TileShapeQK{}) / params.page_size;
       tile_idx =
-          params.ptr_page_table[b_offset + page_local_idx] * tiles_per_page +
+          params.ptr_page_table[b_offset + page_local_idx] * stride_tiles +
           tile_idx % tiles_per_page;
     }
 
@@ -979,11 +989,11 @@ struct DecodeFwdMainloop<
         if (next_page_local_idx < params.max_pages_per_seq) {
           next_tile_idx =
               params.ptr_page_table[b_offset + next_page_local_idx] *
-                  tiles_per_page +
+                  stride_tiles +
               next_tile_idx % tiles_per_page;
         } else {
-          // set to last page
-          next_tile_idx = params.max_pages_per_seq * tiles_per_page - 1;
+          // past end — reuse current tile for safe prefetch
+          next_tile_idx = tile_idx;
         }
       }
       tile_idx = next_tile_idx;

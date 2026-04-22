@@ -120,6 +120,7 @@ void cutlass_paged_decode_impl(
   // additional params
   int total_seqlen_q, total_seqlen_k;
   int num_blocks, block_size, max_blocks_per_seq;
+  int block_stride_elems = 0;
   if (is_varlen) {
     // query: [total_seq, num_heads, head_size]
     batch_size = cu_seqlens_q.numel() - 1;
@@ -146,7 +147,10 @@ void cutlass_paged_decode_impl(
     block_size = key_cache.size(1);
     num_heads_kv = key_cache.size(2);
     max_blocks_per_seq = block_table.size(1);
-    total_seqlen_k = num_blocks * block_size;
+    // contiguous: block_stride_elems = block_size
+    // hybrid:     block_stride_elems = 2 * block_size
+    block_stride_elems = key_cache.stride(0) / key_cache.stride(1);
+    total_seqlen_k = num_blocks * block_stride_elems;
   }
 
   if (is_local) {
@@ -207,6 +211,8 @@ void cutlass_paged_decode_impl(
       "paged_decode_xe2: value_cache must be contiguous in the last dimension "
       "(head_dim), got stride=",
       value_cache.stride(-1));
+
+  args.block_stride_elems = block_stride_elems;
 
   CutlassQKType cuQKType = aten_to_Cutlass_qk_dtype(query, key_cache);
 

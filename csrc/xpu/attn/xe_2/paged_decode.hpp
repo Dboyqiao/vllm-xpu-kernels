@@ -90,6 +90,9 @@ struct paged_decode_args_t {
   int64_t v_stride_page = 0;
   int64_t v_stride_seq = 0;
   int64_t v_stride_heads = 0;
+  // stride(0)/stride(1) of KV cache; = block_size for contiguous,
+  // 2*block_size for hybrid interleaved layout.
+  int block_stride_elems = 0;
 };
 
 template <class FMHAKernel, class ReductionSplitKernel, bool isVarLen>
@@ -205,6 +208,7 @@ struct DecodeKernelLauncher {
     stride_O = cutlass::make_cute_packed_stride(
         StrideO{},
         cute::make_shape(seq_len_qo, head_size_vo, num_heads_q, batch));
+    // stride_Oaccum: internal temp buffer, always contiguous
     stride_Oaccum = cutlass::make_cute_packed_stride(
         StrideO{},
         cute::make_shape(
@@ -251,6 +255,7 @@ struct DecodeKernelLauncher {
          args.block_size,
          args.max_blocks_per_seq,
          args.total_seqlen_k,
+         args.block_stride_elems,
          args.window_size_left,
          args.window_size_right},
         {},
